@@ -81,10 +81,17 @@ class TestEstimateProbShift(unittest.TestCase):
         large = estimate_prob_shift(95.0, 95.0, 2.0, 0.5)
         self.assertGreater(large, small)
 
-    def test_capped_at_25pct(self):
-        """Shift should never exceed 25%."""
+    def test_capped_at_headroom(self):
+        """Shift should never exceed available probability headroom."""
+        # At prob=0.5, max headroom is 0.25
         shift = estimate_prob_shift(95.0, 95.0, 50.0, 0.5)
         self.assertLessEqual(shift, 0.25)
+        # At prob=0.9, max headroom is 0.1 (can't go above 1.0)
+        shift_high = estimate_prob_shift(95.0, 95.0, 50.0, 0.9)
+        self.assertLessEqual(shift_high, 0.10)
+        # At prob=0.05, max headroom is 0.05
+        shift_low = estimate_prob_shift(95.0, 95.0, 50.0, 0.05)
+        self.assertLessEqual(shift_low, 0.05)
 
     def test_zero_strike_fallback(self):
         """Zero strike should use fallback, not crash."""

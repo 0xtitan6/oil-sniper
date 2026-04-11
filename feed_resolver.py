@@ -11,7 +11,8 @@ Month codes: F=Jan G=Feb H=Mar J=Apr K=May M=Jun N=Jul Q=Aug U=Sep V=Oct X=Nov Z
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -86,7 +87,6 @@ async def resolve_active_wti_feed() -> Optional[str]:
             continue
 
         # Skip expired contracts (with 2-day grace)
-        from datetime import timedelta
         if expiry < now - timedelta(days=2):
             continue
 
@@ -127,7 +127,6 @@ async def check_feed_health(feed_id: str) -> bool:
     if not parsed:
         return False
 
-    import time
     publish_time = int(parsed[0].get("price", {}).get("publish_time", 0))
     age = time.time() - publish_time
 

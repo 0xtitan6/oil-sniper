@@ -67,15 +67,14 @@ class HealthMonitor:
                 body = {"error": "not found"}
                 status = "404 Not Found"
 
-            response_body = json.dumps(body, indent=2)
-            response = (
+            response_body = json.dumps(body, indent=2).encode("utf-8")
+            header = (
                 f"HTTP/1.1 {status}\r\n"
                 f"Content-Type: application/json\r\n"
                 f"Content-Length: {len(response_body)}\r\n"
                 f"\r\n"
-                f"{response_body}"
-            )
-            writer.write(response.encode())
+            ).encode("utf-8")
+            writer.write(header + response_body)
             await writer.drain()
         except Exception:
             pass

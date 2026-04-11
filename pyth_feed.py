@@ -35,6 +35,8 @@ class PythFeed:
         self._queue = queue
         self._ws = None
         self._running = False
+        self.last_price_time: float = 0.0  # timestamp of last successful parse
+        self._consecutive_parse_failures: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -122,5 +124,18 @@ class PythFeed:
             except asyncio.QueueFull:
                 logger.debug("Price queue full, dropping update")
 
-        except (KeyError, ValueError):
-            logger.debug("Malformed price update: %s", msg)
+            self.last_price_time = time.time()
+            self._consecutive_parse_failures = 0
+
+        except (KeyError, ValueError, TypeError):
+            self._consecutive_parse_failures += 1
+            if self._consecutive_parse_failures <= 3:
+                logger.warning(
+                    "Pyth parse failure #%d: %s",
+                    self._consecutive_parse_failures,
+                    str(msg)[:200],
+                )
+            elif self._consecutive_parse_failures == 50:
+                logger.error(
+                    "50 consecutive Pyth parse failures — schema may have changed"
+                )

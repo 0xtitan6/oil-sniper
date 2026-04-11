@@ -45,6 +45,10 @@ class VolDetector:
         """Push a new price. Returns a VolSignal if a spike is detected."""
         self._prices.append(price)
 
+        # Trim to avoid unbounded growth — only need last 2 for returns
+        if len(self._prices) > self._window + 10:
+            self._prices = self._prices[-(self._window + 10):]
+
         if len(self._prices) < 3:
             return None
 

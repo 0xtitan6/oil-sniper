@@ -92,10 +92,12 @@ def estimate_prob_shift(
 ) -> float:
     """
     Estimate how much a prediction market probability should shift
-    given a spot price move, accounting for distance to strike.
+    given a spot price move, accounting for distance to strike
+    and current probability level.
 
     Uses a simplified model: the closer spot is to the strike,
-    the more sensitive the probability is to spot moves.
+    the more sensitive the probability is to spot moves. Contracts
+    already near 0 or 1 have less room to move.
     """
     if strike <= 0 or current_price <= 0:
         return abs(pct_move) * 0.05  # fallback
@@ -104,19 +106,23 @@ def estimate_prob_shift(
     distance_pct = abs(current_price - strike) / current_price * 100
 
     # Sensitivity: contracts near the money are most sensitive
-    # At-the-money (~0% distance): 1x multiplier
-    # 5% away: 0.4x multiplier
-    # 10% away: 0.15x multiplier
     sensitivity = math.exp(-0.2 * distance_pct)
 
     # Base shift from the spot move magnitude
-    base_shift = abs(pct_move) * 0.08  # 1% oil move ≈ 8% prob shift at-the-money
+    base_shift = abs(pct_move) * 0.08  # 1% oil move ~ 8% prob shift ATM
 
     # Scale by sensitivity
     implied_shift = base_shift * sensitivity
 
-    # Cap at reasonable bounds
-    return min(implied_shift, 0.25)
+    # Dampen shift based on current probability — contracts near 0 or 1
+    # have less room to move (logistic saturation). A contract at 0.90
+    # can't realistically shift +0.15 to 1.05.
+    prob_headroom = min(current_prob, 1.0 - current_prob) * 2  # 0..1, max at 0.5
+    implied_shift *= max(prob_headroom, 0.1)  # floor at 10% to avoid zero
+
+    # Hard cap: never exceed available headroom
+    max_shift = min(1.0 - current_prob, current_prob, 0.25)
+    return min(implied_shift, max_shift)
 
 
 class SignalEngine:
@@ -278,9 +284,9 @@ class SignalEngine:
         if not pos:
             return
 
-        # Get current market price
+        # Use cached market prices (already refreshed by _position_monitor)
+        # Avoids redundant API calls when closing multiple positions
         exit_price = pos.entry_price  # fallback
-        await self._refresh_markets(force=True)
         for m in self._markets_cache:
             if m.market_id == market_id:
                 exit_price = m.yes_price if pos.side == "yes" else m.no_price
@@ -293,15 +299,26 @@ class SignalEngine:
             pnl_pct = 0.0
         pnl_usd = (pnl_pct / 100) * pos.size_usd
 
-        # Exit by selling our position — use a limit order 1% below
-        # current price to avoid getting front-run, but still fill quickly
+        # Exit by selling our shares — sell the SAME side we hold.
+        # On Polymarket, to exit a YES position you sell YES shares,
+        # NOT buy NO shares (which would be opening a new position).
+        # Price with a 1% haircut for fast fill.
+        exit_filled = True
         if not settings.dry_run:
-            # Sell our side at a slight discount for fast fill
-            sell_price = exit_price * 0.99  # 1% haircut for fast fill
-            counter_side = "no" if pos.side == "yes" else "yes"
-            await self._synth.place_order(
-                market_id, counter_side, pos.size_usd, sell_price
+            sell_price = exit_price * 0.99  # 1% haircut
+            result = await self._synth.place_order(
+                market_id, pos.side, pos.size_usd, sell_price
             )
+            if not result:
+                logger.error(
+                    "EXIT ORDER FAILED for %s — position remains open",
+                    market_id[:16],
+                )
+                exit_filled = False
+
+        if not exit_filled:
+            # Don't remove from tracking — retry next cycle
+            return
 
         now = time.time()
         closed = ClosedTrade(

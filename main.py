@@ -40,6 +40,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 from config import settings
 from feed_resolver import resolve_active_wti_feed
@@ -106,7 +107,7 @@ async def main() -> None:
     logger.info("  Max hold:   %.0fm", settings.max_hold_minutes)
     logger.info("=" * 55)
 
-    if not settings.dry_run and not settings.synthesis_api_key:
+    if not settings.dry_run and not settings.synthesis_api_key.strip():
         logger.error("SNIPER_SYNTHESIS_API_KEY required for live trading")
         sys.exit(1)
 
@@ -114,6 +115,15 @@ async def main() -> None:
     price_queue = asyncio.Queue(maxsize=500)
     pyth = PythFeed(price_queue)
     synthesis = SynthesisClient()
+
+    # Validate API connectivity at startup
+    if not settings.dry_run:
+        logger.info("Validating Synthesis API key...")
+        if not await synthesis.validate_auth():
+            logger.error("Synthesis API key validation failed — check SNIPER_SYNTHESIS_API_KEY")
+            await synthesis.close()
+            sys.exit(1)
+        logger.info("API key validated")
     engine = SignalEngine(price_queue, synthesis)
     health = HealthMonitor(port=8080)
 
@@ -167,15 +177,19 @@ async def main() -> None:
 
 
 async def _heartbeat_loop(health, pyth, engine) -> None:
-    """Send heartbeats from each component to the health monitor."""
+    """Send heartbeats only when components are actually processing data."""
     while True:
         await asyncio.sleep(30)
 
-        # Pyth feed heartbeat — check if queue is receiving
-        if pyth._running:
-            health.heartbeat("pyth_feed")
+        # Pyth feed: only heartbeat if we received a price recently (<120s)
+        if pyth._running and pyth.last_price_time > 0:
+            age = time.time() - pyth.last_price_time
+            if age < 120:
+                health.heartbeat("pyth_feed")
+            else:
+                health.set_status("pyth_feed", "stale (%.0fs)" % age)
 
-        # Signal engine heartbeat
+        # Signal engine: heartbeat if running
         if engine._running:
             health.heartbeat("signal_engine")
 

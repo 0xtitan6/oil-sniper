@@ -81,6 +81,13 @@ class SynthesisClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def validate_auth(self) -> bool:
+        """Probe a lightweight endpoint to verify API key works."""
+        body = await self._request("GET", "/markets/search/test", params={"limit": 1})
+        if body is None:
+            return False
+        return body.get("success", False)
+
     # ── Retry wrapper ──────────────────────────────────────────
 
     async def _request(
@@ -191,6 +198,14 @@ class SynthesisClient:
                             0.5,
                         )
 
+                    # Parse NO price from right side (don't assume 1-yes)
+                    if right_outcome in ("no", "down"):
+                        no_price = _safe_float(m.get("right_price"), 1.0 - yes_price)
+                    elif left_outcome in ("no", "down"):
+                        no_price = _safe_float(m.get("left_price"), 1.0 - yes_price)
+                    else:
+                        no_price = 1.0 - yes_price  # fallback
+
                     vol = _safe_float(m.get("volume") or m.get("volumeNum"), 0)
                     condition_id = str(
                         m.get("condition_id") or m.get("market_id") or m.get("id") or ""
@@ -203,7 +218,7 @@ class SynthesisClient:
                             title=question,
                             slug=slug,
                             yes_price=yes_price,
-                            no_price=1.0 - yes_price,
+                            no_price=no_price,
                             volume=vol,
                             venue=venue,
                         )
