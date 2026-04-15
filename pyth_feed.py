@@ -30,6 +30,16 @@ class PriceUpdate:
     recv_time: float
 
 
+class FeedTimeoutError(Exception):
+    """Raised when feed hasn't received messages in too long."""
+    pass
+
+
+class FeedParseError(Exception):
+    """Raised when too many consecutive parse failures occur."""
+    pass
+
+
 class PythFeed:
     def __init__(self, queue: asyncio.Queue[PriceUpdate]):
         self._queue = queue
@@ -37,12 +47,27 @@ class PythFeed:
         self._running = False
         self.last_price_time: float = 0.0  # timestamp of last successful parse
         self._consecutive_parse_failures: int = 0
+        self._queue_drops: int = 0  # track dropped updates
+        self._last_drop_log_time: float = 0.0
 
     async def start(self) -> None:
         self._running = True
         while self._running:
             try:
                 await self._connect_and_stream()
+            except FeedTimeoutError:
+                logger.error(
+                    "Feed timeout: no messages for %.0fs, reconnecting...",
+                    settings.feed_timeout_secs
+                )
+                await asyncio.sleep(2)
+            except FeedParseError:
+                logger.critical(
+                    "Feed parse error: %d consecutive failures, stopping feed",
+                    settings.max_parse_failures
+                )
+                self._running = False
+                raise
             except ConnectionClosed as e:
                 logger.warning("Pyth WS closed (%s), reconnecting in 2s...", e)
                 await asyncio.sleep(2)
@@ -62,6 +87,7 @@ class PythFeed:
             ping_timeout=10,
         ) as ws:
             self._ws = ws
+            self.last_price_time = time.time()  # Reset on connect
             logger.info("Connected to Pyth Hermes at %s", settings.pyth_ws_url)
 
             # Subscribe to the oil price feed
@@ -77,6 +103,16 @@ class PythFeed:
             async for raw in ws:
                 if not self._running:
                     break
+
+                # Circuit breaker: check for feed timeout
+                now = time.time()
+                if self.last_price_time > 0:
+                    silence = now - self.last_price_time
+                    if silence > settings.feed_timeout_secs:
+                        raise FeedTimeoutError(
+                            f"No valid price updates for {silence:.0f}s"
+                        )
+
                 self._handle_message(raw)
 
     def _handle_message(self, raw: str) -> None:
@@ -122,20 +158,36 @@ class PythFeed:
             try:
                 self._queue.put_nowait(update)
             except asyncio.QueueFull:
-                logger.debug("Price queue full, dropping update")
+                self._queue_drops += 1
+                now = time.time()
+                # Log dropped updates every 60 seconds
+                if now - self._last_drop_log_time > 60.0:
+                    logger.warning(
+                        "Queue full: dropped %d price updates in last 60s",
+                        self._queue_drops
+                    )
+                    self._queue_drops = 0
+                    self._last_drop_log_time = now
 
             self.last_price_time = time.time()
             self._consecutive_parse_failures = 0
 
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError) as e:
             self._consecutive_parse_failures += 1
             if self._consecutive_parse_failures <= 3:
                 logger.warning(
-                    "Pyth parse failure #%d: %s",
+                    "Pyth parse failure #%d: %s - %s",
                     self._consecutive_parse_failures,
+                    type(e).__name__,
                     str(msg)[:200],
                 )
             elif self._consecutive_parse_failures == 50:
                 logger.error(
                     "50 consecutive Pyth parse failures — schema may have changed"
+                )
+
+            # Circuit breaker: stop if too many consecutive failures
+            if self._consecutive_parse_failures >= settings.max_parse_failures:
+                raise FeedParseError(
+                    f"{self._consecutive_parse_failures} consecutive parse failures"
                 )

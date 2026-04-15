@@ -69,10 +69,27 @@ class VolDetector:
             return None
 
         rolling_std = float(np.std(self._returns))
-        if rolling_std < 1e-10:
+
+        # Guard against near-zero volatility (stable market or bad data)
+        # Use a more reasonable threshold to avoid z-score explosion
+        MIN_STD_THRESHOLD = 1e-8
+        if rolling_std < MIN_STD_THRESHOLD:
+            logger.debug(
+                "Volatility near zero (std=%.2e), skipping signal check",
+                rolling_std
+            )
             return None
 
         z_score = abs(ret) / rolling_std
+
+        # Sanity check: extremely high z-scores indicate data issues
+        MAX_REASONABLE_ZSCORE = 100.0
+        if z_score > MAX_REASONABLE_ZSCORE:
+            logger.warning(
+                "Unreasonable z-score %.1f (ret=%.6f, std=%.2e), skipping",
+                z_score, ret, rolling_std
+            )
+            return None
 
         # Check thresholds
         if z_score < self._sigma:
