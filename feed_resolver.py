@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -55,7 +55,7 @@ async def resolve_active_wti_feed() -> Optional[str]:
 
     # Parse and filter feeds
     candidates: List[Tuple[datetime, str, str]] = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     for feed in feeds:
         attrs = feed.get("attributes", {})
@@ -81,8 +81,8 @@ async def resolve_active_wti_feed() -> Optional[str]:
         try:
             month = CODE_TO_MONTH[month_code]
             year = 2020 + int(year_digit)  # "6" = 2026
-            # Approximate expiry: 20th of contract month
-            expiry = datetime(year, month, 20)
+            # Approximate expiry: 20th of contract month (timezone-aware)
+            expiry = datetime(year, month, 20, tzinfo=timezone.utc)
         except (ValueError, IndexError):
             continue
 

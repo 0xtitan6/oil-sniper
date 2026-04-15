@@ -26,7 +26,13 @@ logger = logging.getLogger(__name__)
 # ── Retry config ───────────────────────────────────────────────
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0  # seconds
+MAX_RETRY_DELAY = 8.0  # cap exponential backoff
+# Retry on rate limits, server errors, and transient client errors
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+# These 4xx errors might be transient (rate limits, auth refresh, etc.)
+RETRY_CLIENT_CODES = {400, 403, 408}
+# Never retry these - they indicate permanent failures
+NO_RETRY_CODES = {401, 404, 410, 422}
 
 
 @dataclass(frozen=True)
@@ -95,16 +101,38 @@ class SynthesisClient:
     ) -> Optional[dict]:
         """Make an HTTP request with exponential backoff retry."""
         last_err = None
+        last_status = None
         for attempt in range(MAX_RETRIES + 1):
             try:
                 resp = await self._client.request(method, path, **kwargs)
+                last_status = resp.status_code
 
+                # Check for permanent failures first - don't retry these
+                if resp.status_code in NO_RETRY_CODES:
+                    logger.error(
+                        "Permanent failure HTTP %d on %s %s (no retry)",
+                        resp.status_code, method, path,
+                    )
+                    return None
+
+                # Retry on server errors and rate limits
                 if resp.status_code in RETRY_STATUS_CODES:
-                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
                     logger.warning(
                         "API %d on %s %s, retrying in %.1fs (attempt %d/%d)",
                         resp.status_code, method, path, delay, attempt + 1, MAX_RETRIES,
                     )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Retry on transient client errors (might be rate limit, auth refresh, etc.)
+                if resp.status_code in RETRY_CLIENT_CODES:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+                    logger.warning(
+                        "Transient client error %d on %s %s, retrying in %.1fs (attempt %d/%d)",
+                        resp.status_code, method, path, delay, attempt + 1, MAX_RETRIES,
+                    )
+                    last_err = f"HTTP {resp.status_code}"
                     await asyncio.sleep(delay)
                     continue
 
@@ -118,7 +146,7 @@ class SynthesisClient:
                 return body
 
             except httpx.TimeoutException:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                delay = min(RETRY_BASE_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
                 logger.warning(
                     "Timeout on %s %s, retrying in %.1fs (%d/%d)",
                     method, path, delay, attempt + 1, MAX_RETRIES,
@@ -127,11 +155,13 @@ class SynthesisClient:
                 await asyncio.sleep(delay)
 
             except httpx.HTTPStatusError as e:
+                # This shouldn't happen since we handle status codes above,
+                # but handle it defensively
                 logger.error("HTTP %d on %s %s: %s", e.response.status_code, method, path, e)
                 return None
 
             except httpx.HTTPError as e:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                delay = min(RETRY_BASE_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
                 logger.warning(
                     "HTTP error on %s %s: %s, retrying in %.1fs",
                     method, path, e, delay,
@@ -139,7 +169,10 @@ class SynthesisClient:
                 last_err = str(e)
                 await asyncio.sleep(delay)
 
-        logger.error("All retries exhausted on %s %s (last: %s)", method, path, last_err)
+        logger.error(
+            "All retries exhausted on %s %s (last_err=%s, last_status=%s)",
+            method, path, last_err, last_status
+        )
         return None
 
     # ── Market Discovery ───────────────────────────────────────
@@ -306,7 +339,8 @@ class SynthesisClient:
         Check if there's enough orderbook depth to fill our trade
         without excessive slippage.
 
-        Rule: available depth on our side must be >= 2x our trade size.
+        Rule: available depth on our side must be >= (depth_multiplier)x our trade size.
+        Spread must be below max_spread.
         """
         depth = await self.get_orderbook_depth(market_id)
         if not depth:
@@ -319,18 +353,19 @@ class SynthesisClient:
         else:
             available = depth.bid_depth_usd
 
-        min_required = size_usd * 2  # require 2x depth
+        min_required = size_usd * settings.depth_multiplier
 
         if available < min_required:
             logger.debug(
-                "Insufficient depth for %s %s: $%.1f available, $%.1f required",
-                side, market_id[:16], available, min_required,
+                "Insufficient depth for %s %s: $%.1f available, $%.1f required (%.1fx)",
+                side, market_id[:16], available, min_required, settings.depth_multiplier,
             )
             return False
 
-        if depth.spread > 0.05:
+        if depth.spread > settings.max_spread:
             logger.debug(
-                "Spread too wide for %s: %.3f", market_id[:16], depth.spread,
+                "Spread too wide for %s: %.3f > %.3f max",
+                market_id[:16], depth.spread, settings.max_spread,
             )
             return False
 

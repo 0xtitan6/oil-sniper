@@ -42,10 +42,8 @@ class TestParseStrike(unittest.TestCase):
     def test_hit_high(self):
         """Polymarket format: 'hit (HIGH) $120'."""
         result = parse_strike("Will WTI Crude Oil (WTI) hit (HIGH) $120 in April?")
-        # "hit" is not in our keyword list, so this returns None
-        # That's OK — the fallback linear model handles it
-        # This test documents the current behavior
-        self.assertIsNone(result)
+        # "hit" is now in our keyword list for better market coverage
+        self.assertEqual(result, 120.0)
 
     def test_settle_over(self):
         """Polymarket format: 'settle over $90'."""

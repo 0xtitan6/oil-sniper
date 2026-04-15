@@ -66,6 +66,16 @@ class Settings(BaseSettings):
     # Skip markets where yes_price is too extreme (illiquid tails)
     max_price_extreme: float = 0.92
     min_price_extreme: float = 0.08
+    # Depth check multiplier: require this multiple of trade size in orderbook
+    depth_multiplier: float = 2.0
+    # Max spread allowed for entering a position (e.g., 0.05 = 5%)
+    max_spread: float = 0.05
+
+    # ── Pyth Feed Resilience ───────────────────────────────────
+    # Max seconds without messages before considering feed dead
+    feed_timeout_secs: float = 120.0
+    # Max consecutive parse failures before stopping
+    max_parse_failures: int = 100
 
     # ── Logging ────────────────────────────────────────────────
     log_level: str = "INFO"

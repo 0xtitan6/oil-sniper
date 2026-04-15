@@ -31,6 +31,11 @@ from volatility import VolDetector, VolSignal
 logger = logging.getLogger(__name__)
 
 
+class ExposureLimitExceeded(Exception):
+    """Raised when trade would exceed exposure limits."""
+    pass
+
+
 @dataclass
 class OpenPosition:
     market_id: str
@@ -66,21 +71,96 @@ class ClosedTrade:
 
 # ── Strike Parser ──────────────────────────────────────────────
 # Matches patterns like "above $70", "over 65.50", "below $80/barrel"
-_STRIKE_PATTERN = re.compile(
-    r"(?:above|over|exceed|below|under|fall\s+to|drop\s+to|higher\s+than|lower\s+than)"
-    r"\s+\$?(\d+(?:\.\d+)?)",
+# Extended to catch more production patterns from Polymarket/Kalshi
+
+# Pattern 1: Directional keywords (above, below, etc.)
+# Allows optional parenthetical like "(HIGH)" or "(LOW)" between keyword and price
+_STRIKE_PATTERN_DIRECTIONAL = re.compile(
+    r"(?:above|over|exceed|below|under|fall\s+to|drop\s+to|higher\s+than|lower\s+than|"
+    r"hit|reach|touch|break|settle\s+(?:above|below|over|under)|"
+    r"close\s+(?:above|below|over|under)|end\s+(?:above|below))"
+    r"(?:\s+\([A-Z]+\))?"  # optional "(HIGH)" or "(LOW)" etc.
+    r"\s+\$?(\d+(?:\.\d+)?)"
+    r"(?:\s*(?:/|per)\s*(?:barrel|bbl))?",  # optional "/barrel" suffix
     re.IGNORECASE,
 )
 
+# Pattern 2: Prediction-style phrases like "to $70" or "at or above $70"
+# Avoid matching simple statements like "Oil is at $70 today"
+_STRIKE_PATTERN_TO_PRICE = re.compile(
+    r"(?:to|@)\s+\$?(\d+(?:\.\d+)?)"
+    r"(?:\s*(?:/|per)\s*(?:barrel|bbl))?",
+    re.IGNORECASE,
+)
+
+# Pattern for "at or above/below" which is a prediction target
+_STRIKE_PATTERN_AT_OR = re.compile(
+    r"at\s+or\s+(?:above|below|over|under)\s+\$?(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Pattern 3: Range patterns like "between $60 and $70" - extract midpoint
+_STRIKE_PATTERN_RANGE = re.compile(
+    r"between\s+\$?(\d+(?:\.\d+)?)\s+(?:and|to|-)\s+\$?(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Maximum reasonable title length to prevent regex DoS
+_MAX_TITLE_LENGTH = 500
+
 
 def parse_strike(title: str) -> Optional[float]:
-    """Extract the strike/target price from a prediction market title."""
-    match = _STRIKE_PATTERN.search(title)
+    """
+    Extract the strike/target price from a prediction market title.
+
+    Handles various patterns:
+    - "Will WTI be above $70?"
+    - "Oil to hit $80/barrel"
+    - "WTI settle above $65"
+    - "Crude oil close below $60"
+    - "Price between $70 and $80" (returns midpoint)
+
+    Returns None if no strike can be parsed.
+    """
+    # Guard against extremely long titles (regex DoS prevention)
+    if len(title) > _MAX_TITLE_LENGTH:
+        logger.warning("Market title too long (%d chars), skipping strike parse", len(title))
+        return None
+
+    # Try directional pattern first (most common)
+    match = _STRIKE_PATTERN_DIRECTIONAL.search(title)
     if match:
         try:
             return float(match.group(1))
         except ValueError:
             pass
+
+    # Try "to price" pattern (e.g., "rise to $70")
+    match = _STRIKE_PATTERN_TO_PRICE.search(title)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+
+    # Try "at or above/below" pattern
+    match = _STRIKE_PATTERN_AT_OR.search(title)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+
+    # Try range pattern (return midpoint)
+    match = _STRIKE_PATTERN_RANGE.search(title)
+    if match:
+        try:
+            low = float(match.group(1))
+            high = float(match.group(2))
+            return (low + high) / 2.0
+        except ValueError:
+            pass
+
     return None
 
 
@@ -143,6 +223,9 @@ class SignalEngine:
         self._markets_cache_time: float = 0.0
         self._markets_cache_ttl: float = 60.0
         self._last_pyth_price: float = 0.0
+
+        # Lock to prevent race conditions in exposure management
+        self._execution_lock = asyncio.Lock()
 
         # Restore positions from persistent store
         self._restore_positions()
@@ -250,10 +333,16 @@ class SignalEngine:
                 # Get current price for our side
                 current = market.yes_price if pos.side == "yes" else market.no_price
 
-                # P&L calculation
+                # P&L calculation - handle invalid entry_price (zombie position fix)
                 if pos.entry_price > 0:
                     pnl_pct = ((current - pos.entry_price) / pos.entry_price) * 100
                 else:
+                    # Invalid entry_price - this is a zombie position, close it
+                    logger.error(
+                        "Position %s has invalid entry_price=%.4f, closing as zombie",
+                        mid[:12], pos.entry_price
+                    )
+                    to_close.append((mid, "invalid_entry_price"))
                     continue
 
                 # Take profit
@@ -274,9 +363,10 @@ class SignalEngine:
                     to_close.append((mid, "stop_loss"))
                     continue
 
-            # Execute closes
+            # Execute closes with lock to prevent race with signal processing
             for mid, reason in to_close:
-                await self._close_position(mid, reason)
+                async with self._execution_lock:
+                    await self._close_position(mid, reason)
 
     async def _close_position(self, market_id: str, reason: str) -> None:
         """Close an open position and record the trade."""
@@ -284,13 +374,23 @@ class SignalEngine:
         if not pos:
             return
 
-        # Use cached market prices (already refreshed by _position_monitor)
-        # Avoids redundant API calls when closing multiple positions
-        exit_price = pos.entry_price  # fallback
+        # Force refresh markets to get fresh exit price (avoid stale data)
+        await self._refresh_markets(force=True)
+
+        # Get exit price from fresh market data
+        exit_price = pos.entry_price  # fallback only if market not found
+        market_found = False
         for m in self._markets_cache:
             if m.market_id == market_id:
                 exit_price = m.yes_price if pos.side == "yes" else m.no_price
+                market_found = True
                 break
+
+        if not market_found:
+            logger.warning(
+                "Market %s not found in cache during close, using entry_price as fallback",
+                market_id[:12]
+            )
 
         # Calculate P&L
         if pos.entry_price > 0:
@@ -339,38 +439,53 @@ class SignalEngine:
             order_id=pos.order_id,
         )
         self._closed.append(closed)
+
+        # Persist to database with error handling
+        db_error = False
+        try:
+            self._store.remove_position(market_id)
+            self._store.save_closed_trade(
+                market_id=closed.market_id,
+                market_title=closed.market_title,
+                side=closed.side,
+                entry_price=closed.entry_price,
+                exit_price=closed.exit_price,
+                size_usd=closed.size_usd,
+                edge=closed.edge,
+                signal_z=closed.signal_z,
+                signal_pct=closed.signal_pct,
+                entry_time=closed.entry_time,
+                exit_time=closed.exit_time,
+                pnl_pct=closed.pnl_pct,
+                pnl_usd=closed.pnl_usd,
+                exit_reason=closed.exit_reason,
+                order_id=closed.order_id,
+            )
+        except Exception as e:
+            # DB persistence failed - log but continue
+            # Position is already closed in market, we need to update memory state
+            logger.error(
+                "DB error while closing position %s: %s. "
+                "Trade executed but may not be persisted correctly.",
+                market_id[:12], e
+            )
+            db_error = True
+
+        # Update memory state regardless of DB error
+        # (the position is closed in the market)
         self._total_exposure -= pos.size_usd
         del self._positions[market_id]
 
-        # Persist
-        self._store.remove_position(market_id)
-        self._store.save_closed_trade(
-            market_id=closed.market_id,
-            market_title=closed.market_title,
-            side=closed.side,
-            entry_price=closed.entry_price,
-            exit_price=closed.exit_price,
-            size_usd=closed.size_usd,
-            edge=closed.edge,
-            signal_z=closed.signal_z,
-            signal_pct=closed.signal_pct,
-            entry_time=closed.entry_time,
-            exit_time=closed.exit_time,
-            pnl_pct=closed.pnl_pct,
-            pnl_usd=closed.pnl_usd,
-            exit_reason=closed.exit_reason,
-            order_id=closed.order_id,
-        )
-
         hold_mins = (now - pos.entry_time) / 60
         logger.info(
-            "CLOSED [%s]: %s %s P&L=$%+.2f (%.1f%%) held=%.1fm",
+            "CLOSED [%s]: %s %s P&L=$%+.2f (%.1f%%) held=%.1fm%s",
             reason,
             pos.side.upper(),
             market_id[:12],
             pnl_usd,
             pnl_pct,
             hold_mins,
+            " (DB ERROR)" if db_error else "",
         )
 
     # ── Signal Handling ────────────────────────────────────────
@@ -391,51 +506,56 @@ class SignalEngine:
             logger.warning("No oil markets found — skipping signal")
             return
 
-        if self._total_exposure >= settings.max_total_exposure_usd:
-            logger.warning(
-                "Max exposure reached ($%.2f) — skipping", self._total_exposure
-            )
-            return
-
-        for market in self._markets_cache:
-            # Skip if we already have a position in this market
-            if market.market_id in self._positions:
-                continue
-
-            # Liquidity filter
-            if not self._passes_liquidity_filter(market):
-                continue
-
-            # Edge calculation
-            edge = self._calc_edge(market, signal)
-            if edge is None:
-                continue
-
-            side, expected_edge = edge
-            if expected_edge < settings.min_edge:
-                logger.debug(
-                    "Edge too small (%.3f < %.3f) on %s",
-                    expected_edge,
-                    settings.min_edge,
-                    market.title[:50],
+        # Use lock to prevent race conditions with position monitor
+        # This ensures exposure checks and trade execution are atomic
+        async with self._execution_lock:
+            if self._total_exposure >= settings.max_total_exposure_usd:
+                logger.warning(
+                    "Max exposure reached ($%.2f) — skipping", self._total_exposure
                 )
-                continue
+                return
 
-            remaining = settings.max_total_exposure_usd - self._total_exposure
-            size_usd = min(settings.max_trade_size_usd, remaining)
-            if size_usd < 1.0:
-                break
-
-            # Orderbook depth check
-            if not settings.dry_run:
-                depth_ok = await self._synth.check_depth_ok(
-                    market.market_id, size_usd, side
-                )
-                if not depth_ok:
-                    logger.debug("Depth check failed for %s", market.title[:40])
+            for market in self._markets_cache:
+                # Skip if we already have a position in this market
+                if market.market_id in self._positions:
                     continue
 
-            await self._execute(market, side, size_usd, expected_edge, signal)
+                # Liquidity filter
+                if not self._passes_liquidity_filter(market):
+                    continue
+
+                # Edge calculation
+                edge = self._calc_edge(market, signal)
+                if edge is None:
+                    continue
+
+                side, expected_edge = edge
+                if expected_edge < settings.min_edge:
+                    logger.debug(
+                        "Edge too small (%.3f < %.3f) on %s",
+                        expected_edge,
+                        settings.min_edge,
+                        market.title[:50],
+                    )
+                    continue
+
+                # Re-check exposure limit before each trade (prevents TOCTOU race)
+                remaining = settings.max_total_exposure_usd - self._total_exposure
+                size_usd = min(settings.max_trade_size_usd, remaining)
+                if size_usd < 1.0:
+                    logger.debug("Exposure limit reached mid-signal, stopping")
+                    break
+
+                # Orderbook depth check
+                if not settings.dry_run:
+                    depth_ok = await self._synth.check_depth_ok(
+                        market.market_id, size_usd, side
+                    )
+                    if not depth_ok:
+                        logger.debug("Depth check failed for %s", market.title[:40])
+                        continue
+
+                await self._execute(market, side, size_usd, expected_edge, signal)
 
     # ── Liquidity Filter ───────────────────────────────────────
 
@@ -564,7 +684,6 @@ class SignalEngine:
 
         if result:
             now = time.time()
-            self._total_exposure += size_usd
             pos = OpenPosition(
                 market_id=market.market_id,
                 market_title=market.title,
@@ -577,21 +696,38 @@ class SignalEngine:
                 signal_pct=signal.pct_move,
                 order_id=result.order_id,
             )
-            self._positions[market.market_id] = pos
 
-            # Persist to disk
-            self._store.save_position(
-                market_id=pos.market_id,
-                market_title=pos.market_title,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                size_usd=pos.size_usd,
-                entry_time=pos.entry_time,
-                edge=pos.edge,
-                signal_z=pos.signal_z,
-                signal_pct=pos.signal_pct,
-                order_id=pos.order_id,
-            )
+            # Try to persist to disk first - if this fails, we don't want
+            # to track the position in memory either (could lead to orphaned positions)
+            try:
+                self._store.save_position(
+                    market_id=pos.market_id,
+                    market_title=pos.market_title,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    size_usd=pos.size_usd,
+                    entry_time=pos.entry_time,
+                    edge=pos.edge,
+                    signal_z=pos.signal_z,
+                    signal_pct=pos.signal_pct,
+                    order_id=pos.order_id,
+                )
+            except Exception as e:
+                # DB save failed - this is critical because we have a live position
+                # but can't track it properly
+                logger.critical(
+                    "CRITICAL: Position opened in market but DB save failed! "
+                    "market_id=%s, size=$%.2f, order_id=%s, error=%s",
+                    market.market_id[:16], size_usd, result.order_id, e
+                )
+                # Still track in memory so we can try to close it
+                self._positions[market.market_id] = pos
+                self._total_exposure += size_usd
+                return
+
+            # DB save succeeded, now track in memory
+            self._positions[market.market_id] = pos
+            self._total_exposure += size_usd
 
             logger.info(
                 "OPEN #%d: %s %s $%.2f @ %.4f [%s] exposure=$%.2f | positions=%d",
