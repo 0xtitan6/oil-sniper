@@ -31,6 +31,11 @@ from volatility import VolDetector, VolSignal
 logger = logging.getLogger(__name__)
 
 
+class ExposureLimitExceeded(Exception):
+    """Raised when trade would exceed exposure limits."""
+    pass
+
+
 @dataclass
 class OpenPosition:
     market_id: str
@@ -144,6 +149,9 @@ class SignalEngine:
         self._markets_cache_ttl: float = 60.0
         self._last_pyth_price: float = 0.0
 
+        # Lock to prevent race conditions in exposure management
+        self._execution_lock = asyncio.Lock()
+
         # Restore positions from persistent store
         self._restore_positions()
 
@@ -250,10 +258,16 @@ class SignalEngine:
                 # Get current price for our side
                 current = market.yes_price if pos.side == "yes" else market.no_price
 
-                # P&L calculation
+                # P&L calculation - handle invalid entry_price (zombie position fix)
                 if pos.entry_price > 0:
                     pnl_pct = ((current - pos.entry_price) / pos.entry_price) * 100
                 else:
+                    # Invalid entry_price - this is a zombie position, close it
+                    logger.error(
+                        "Position %s has invalid entry_price=%.4f, closing as zombie",
+                        mid[:12], pos.entry_price
+                    )
+                    to_close.append((mid, "invalid_entry_price"))
                     continue
 
                 # Take profit
@@ -274,9 +288,10 @@ class SignalEngine:
                     to_close.append((mid, "stop_loss"))
                     continue
 
-            # Execute closes
+            # Execute closes with lock to prevent race with signal processing
             for mid, reason in to_close:
-                await self._close_position(mid, reason)
+                async with self._execution_lock:
+                    await self._close_position(mid, reason)
 
     async def _close_position(self, market_id: str, reason: str) -> None:
         """Close an open position and record the trade."""
@@ -284,13 +299,23 @@ class SignalEngine:
         if not pos:
             return
 
-        # Use cached market prices (already refreshed by _position_monitor)
-        # Avoids redundant API calls when closing multiple positions
-        exit_price = pos.entry_price  # fallback
+        # Force refresh markets to get fresh exit price (avoid stale data)
+        await self._refresh_markets(force=True)
+
+        # Get exit price from fresh market data
+        exit_price = pos.entry_price  # fallback only if market not found
+        market_found = False
         for m in self._markets_cache:
             if m.market_id == market_id:
                 exit_price = m.yes_price if pos.side == "yes" else m.no_price
+                market_found = True
                 break
+
+        if not market_found:
+            logger.warning(
+                "Market %s not found in cache during close, using entry_price as fallback",
+                market_id[:12]
+            )
 
         # Calculate P&L
         if pos.entry_price > 0:
@@ -391,51 +416,56 @@ class SignalEngine:
             logger.warning("No oil markets found — skipping signal")
             return
 
-        if self._total_exposure >= settings.max_total_exposure_usd:
-            logger.warning(
-                "Max exposure reached ($%.2f) — skipping", self._total_exposure
-            )
-            return
-
-        for market in self._markets_cache:
-            # Skip if we already have a position in this market
-            if market.market_id in self._positions:
-                continue
-
-            # Liquidity filter
-            if not self._passes_liquidity_filter(market):
-                continue
-
-            # Edge calculation
-            edge = self._calc_edge(market, signal)
-            if edge is None:
-                continue
-
-            side, expected_edge = edge
-            if expected_edge < settings.min_edge:
-                logger.debug(
-                    "Edge too small (%.3f < %.3f) on %s",
-                    expected_edge,
-                    settings.min_edge,
-                    market.title[:50],
+        # Use lock to prevent race conditions with position monitor
+        # This ensures exposure checks and trade execution are atomic
+        async with self._execution_lock:
+            if self._total_exposure >= settings.max_total_exposure_usd:
+                logger.warning(
+                    "Max exposure reached ($%.2f) — skipping", self._total_exposure
                 )
-                continue
+                return
 
-            remaining = settings.max_total_exposure_usd - self._total_exposure
-            size_usd = min(settings.max_trade_size_usd, remaining)
-            if size_usd < 1.0:
-                break
-
-            # Orderbook depth check
-            if not settings.dry_run:
-                depth_ok = await self._synth.check_depth_ok(
-                    market.market_id, size_usd, side
-                )
-                if not depth_ok:
-                    logger.debug("Depth check failed for %s", market.title[:40])
+            for market in self._markets_cache:
+                # Skip if we already have a position in this market
+                if market.market_id in self._positions:
                     continue
 
-            await self._execute(market, side, size_usd, expected_edge, signal)
+                # Liquidity filter
+                if not self._passes_liquidity_filter(market):
+                    continue
+
+                # Edge calculation
+                edge = self._calc_edge(market, signal)
+                if edge is None:
+                    continue
+
+                side, expected_edge = edge
+                if expected_edge < settings.min_edge:
+                    logger.debug(
+                        "Edge too small (%.3f < %.3f) on %s",
+                        expected_edge,
+                        settings.min_edge,
+                        market.title[:50],
+                    )
+                    continue
+
+                # Re-check exposure limit before each trade (prevents TOCTOU race)
+                remaining = settings.max_total_exposure_usd - self._total_exposure
+                size_usd = min(settings.max_trade_size_usd, remaining)
+                if size_usd < 1.0:
+                    logger.debug("Exposure limit reached mid-signal, stopping")
+                    break
+
+                # Orderbook depth check
+                if not settings.dry_run:
+                    depth_ok = await self._synth.check_depth_ok(
+                        market.market_id, size_usd, side
+                    )
+                    if not depth_ok:
+                        logger.debug("Depth check failed for %s", market.title[:40])
+                        continue
+
+                await self._execute(market, side, size_usd, expected_edge, signal)
 
     # ── Liquidity Filter ───────────────────────────────────────
 

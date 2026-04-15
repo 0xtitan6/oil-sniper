@@ -20,7 +20,7 @@ DB_PATH = os.environ.get("SNIPER_TRADE_DB", "trades.db")
 
 
 def _init_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=10.0)  # Explicit timeout to avoid indefinite hangs
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
@@ -90,32 +90,47 @@ class TradeStore:
         signal_pct: float,
         order_id: str,
     ) -> None:
-        self._db.execute(
-            """
-            INSERT OR REPLACE INTO open_positions
-            (market_id, market_title, side, entry_price, size_usd, entry_time,
-             edge, signal_z, signal_pct, order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (market_id, market_title, side, entry_price, size_usd,
-             entry_time, edge, signal_z, signal_pct, order_id),
-        )
-        self._db.commit()
+        try:
+            self._db.execute(
+                """
+                INSERT OR REPLACE INTO open_positions
+                (market_id, market_title, side, entry_price, size_usd, entry_time,
+                 edge, signal_z, signal_pct, order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (market_id, market_title, side, entry_price, size_usd,
+                 entry_time, edge, signal_z, signal_pct, order_id),
+            )
+            self._db.commit()
+        except sqlite3.Error as e:
+            logger.error(
+                "Failed to save position %s to database: %s",
+                market_id[:12], e
+            )
+            raise  # Re-raise so caller knows the save failed
 
     def remove_position(self, market_id: str) -> None:
-        self._db.execute(
-            "DELETE FROM open_positions WHERE market_id = ?", (market_id,)
-        )
-        self._db.commit()
+        try:
+            self._db.execute(
+                "DELETE FROM open_positions WHERE market_id = ?", (market_id,)
+            )
+            self._db.commit()
+        except sqlite3.Error as e:
+            logger.error(
+                "Failed to remove position %s from database: %s",
+                market_id[:12], e
+            )
+            raise  # Re-raise so caller knows the removal failed
 
     def load_positions(self) -> List[dict]:
-        rows = self._db.execute(
-            "SELECT * FROM open_positions"
-        ).fetchall()
+        # Use explicit column list instead of SELECT * for schema stability
         cols = [
             "market_id", "market_title", "side", "entry_price", "size_usd",
             "entry_time", "edge", "signal_z", "signal_pct", "order_id",
         ]
+        rows = self._db.execute(
+            f"SELECT {', '.join(cols)} FROM open_positions"
+        ).fetchall()
         return [dict(zip(cols, row)) for row in rows]
 
     def position_count(self) -> int:
@@ -143,19 +158,26 @@ class TradeStore:
         exit_reason: str,
         order_id: str,
     ) -> None:
-        self._db.execute(
-            """
-            INSERT INTO closed_trades
-            (market_id, market_title, side, entry_price, exit_price, size_usd,
-             edge, signal_z, signal_pct, entry_time, exit_time,
-             pnl_pct, pnl_usd, exit_reason, order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (market_id, market_title, side, entry_price, exit_price, size_usd,
-             edge, signal_z, signal_pct, entry_time, exit_time,
-             pnl_pct, pnl_usd, exit_reason, order_id),
-        )
-        self._db.commit()
+        try:
+            self._db.execute(
+                """
+                INSERT INTO closed_trades
+                (market_id, market_title, side, entry_price, exit_price, size_usd,
+                 edge, signal_z, signal_pct, entry_time, exit_time,
+                 pnl_pct, pnl_usd, exit_reason, order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (market_id, market_title, side, entry_price, exit_price, size_usd,
+                 edge, signal_z, signal_pct, entry_time, exit_time,
+                 pnl_pct, pnl_usd, exit_reason, order_id),
+            )
+            self._db.commit()
+        except sqlite3.Error as e:
+            logger.error(
+                "Failed to save closed trade %s to database: %s",
+                market_id[:12], e
+            )
+            raise  # Re-raise so caller knows the save failed
 
     def get_total_pnl(self) -> float:
         row = self._db.execute(
